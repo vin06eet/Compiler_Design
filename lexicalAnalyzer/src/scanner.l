@@ -357,7 +357,7 @@ ESC        (\\[abfnrtv\\'"?]|\\x[0-9A-Fa-f]+|\\[0-7]{1,3})
              if(assignment_context) assignment_context = 0;
              BEGIN(INITIAL);
            }
-<STRING>\"([^"\\\n]|{ESC})*\\\n    { /* continued line inside string */ }
+
 <STRING>\n  { fprintf(stderr,"[line %d] ERROR: Unterminated string literal\n", yylineno-1); BEGIN(INITIAL); }
 <STRING>.   { /* consume */ }
 
