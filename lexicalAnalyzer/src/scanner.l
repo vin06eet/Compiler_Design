@@ -28,13 +28,13 @@ static int is_ident_char_c (unsigned char c){ return (c=='_' || isalnum(c)); }
 
 typedef struct Symbol {
     char* name;
-    char* type;            /* e.g., int, float, char*, struct X */
-    char* dimensions;      /* e.g., [10][20] */
-    int   frequency;       /* number of appearances */
-    char* return_type;     /* for functions */
-    char* param_lists;     /* concatenated lists observed in function calls or declarations */
-    int   is_function;     /* boolean */
-    struct Symbol* next;   /* chaining in hash bucket */
+    char* type;            
+    char* dimensions;      
+    int   frequency;       
+    char* return_type;     
+    char* param_lists;     
+    int   is_function;    
+    struct Symbol* next;  
 } Symbol;
 
 #define SYM_HASH_SIZE 211
@@ -102,10 +102,10 @@ static void sym_append_params(Symbol* s, const char* params){
 }
 
 typedef struct Constant {
-    char* var_name;  /* For #define NAME value, or variable name for other constants */
+    char* var_name;  
     int   line;
-    char* value;     /* literal text */
-    char* type;      /* "int", "float", "char", "string", "hex", "oct", "bin", "macro" */
+    char* value;     
+    char* type;      
 } Constant;
 
 static Constant* consts = NULL;
@@ -129,7 +129,7 @@ static char last_ident[256] = {0};
 static int last_was_ident = 0;
 static int array_capture_for_ident = 0;
 static int brace_depth = 0;
-static int assignment_context = 0;  /* Track if we're in an assignment */
+static int assignment_context = 0;  
 static char pending_var[256] = {0}; /* Variable name for pending constant assignment */
 
 static void start_declaration(const char* t){
