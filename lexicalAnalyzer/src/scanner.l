@@ -23,6 +23,8 @@ static char* trim(char* s){
     size_t j=n; while(j>i && isspace((unsigned char)s[j-1])) j--;
     size_t m=j-i; memmove(s, s+i, m); s[m]='\0'; return s;
 }
+static int is_ident_start_c(unsigned char c){ return (c=='_' || isalpha(c)); }
+static int is_ident_char_c (unsigned char c){ return (c=='_' || isalnum(c)); }
 
 typedef struct Symbol {
     char* name;
@@ -144,6 +146,7 @@ static void end_declaration(){
     last_type[0]='\0';
     assignment_context = 0;
     pending_var[0] = '\0';
+    array_capture_for_ident = 0;
 }
 
 static int paren_depth = 0;
@@ -160,12 +163,84 @@ static void args_begin(Symbol* s){
 static void args_push_char(int c){
     if(!capturing_args) return;
     if(arg_len + 2 > arg_cap){
-        arg_cap *= 2;
+        arg_cap = arg_cap ? arg_cap*2 : 256;
         arg_buffer = (char*)realloc(arg_buffer, arg_cap);
     }
     arg_buffer[arg_len++] = (char)c;
     arg_buffer[arg_len] = '\0';
 }
+
+/* helper: find start index of last identifier in s, or -1 if none */
+static int find_last_ident_pos(const char* s){
+    if(!s) return -1;
+    int i = (int)strlen(s) - 1;
+    while(i >= 0){
+        if(is_ident_char_c((unsigned char)s[i])){
+            int end = i;
+            int j = i;
+            while(j >= 0 && is_ident_char_c((unsigned char)s[j])) j--;
+            /* Now identifier is s[j+1 .. end] */
+            return j+1;
+        }
+        i--;
+    }
+    return -1;
+}
+
+/* Parse arg_buffer to assign parameter types to symbols */
+static void parse_and_register_params(const char* params_text){
+    if(!params_text || !*params_text) return;
+
+    int depth = 0; /* for nested parens (function pointers) */
+    size_t n = strlen(params_text);
+    size_t start = 0;
+
+    for(size_t i=0; i<=n; ++i){
+        int is_end = (i==n);
+        char c = is_end ? ',' : params_text[i];
+
+        if(!is_end){
+            if(c=='(') depth++;
+            else if(c==')' && depth>0) depth--;
+        }
+        if(c==',' && depth==0 || is_end){
+            /* segment = params_text[start..i) */
+            char* seg = xsubstr(params_text, start, i);
+            trim(seg);
+            if(seg[0]){
+                /* skip 'void' and '...' */
+                if(!(strcmp(seg,"void")==0 || strcmp(seg,"...")==0)){
+                    int pos = find_last_ident_pos(seg);
+                    if(pos >= 0){
+                        /* name is seg[pos..] until non-ident */
+                        int k = pos;
+                        while(seg[k] && is_ident_char_c((unsigned char)seg[k])) k++;
+                        char saved = seg[k];
+                        seg[k] = '\0';
+                        const char* name = seg + pos;
+
+                        /* type is seg[0..pos) trimmed */
+                        char* tpart = xsubstr(seg, 0, pos);
+                        trim(tpart);
+
+                        /* Touch symbol and set type if unknown */
+                        Symbol* s = sym_touch(name);
+                        if(tpart[0] && (!s->type || s->type[0]=='\0')){
+                            sym_set_type(s, tpart);
+                        }
+
+                        /* restore and cleanup */
+                        seg[k] = saved;
+                        free(tpart);
+                    }
+                }
+            }
+            free(seg);
+            start = i+1;
+        }
+    }
+}
+
 static void args_end(){
     if(capturing_args && current_func_sym){
         /* remove trailing ) if present */
@@ -174,6 +249,10 @@ static void args_end(){
         trim(s);
         sym_append_params(current_func_sym, s);
         current_func_sym->is_function = 1;
+
+        /* NEW: parse parameter text and assign types to parameter symbols */
+        parse_and_register_params(s);
+
         free(s);
     }
     capturing_args = 0; paren_depth = 0; arg_len = 0; current_func_sym = NULL;
@@ -251,11 +330,12 @@ ESC        (\\[abfnrtv\\'"?]|\\x[0-9A-Fa-f]+|\\[0-7]{1,3})
 
 "//".*     { /* ignore */ }
 
-"/*"       { BEGIN(COMMENT); int depth=1; int c1,c2;
+"/*"       {
+             BEGIN(COMMENT); int depth=1; int c1,c2;
              while(depth>0){
                 c1 = input();
                 if(c1==EOF){ fprintf(stderr,"[line %d] ERROR: Unterminated comment\n", yylineno); BEGIN(INITIAL); break; }
-                if(c1=='\n'){ /* yylineno auto increments via flex */ }
+                if(c1=='\n'){ yylineno++; }  /* advance line count manually here */
                 if(c1=='/'){
                     c2 = input();
                     if(c2=='*'){ depth++; }
@@ -277,7 +357,7 @@ ESC        (\\[abfnrtv\\'"?]|\\x[0-9A-Fa-f]+|\\[0-7]{1,3})
              if(assignment_context) assignment_context = 0;
              BEGIN(INITIAL);
            }
-<STRING>\"([^"\\\n]|{ESC})*\\\n    { /* continued line inside string - treat as part of string */ }
+<STRING>\"([^"\\\n]|{ESC})*\\\n    { /* continued line inside string */ }
 <STRING>\n  { fprintf(stderr,"[line %d] ERROR: Unterminated string literal\n", yylineno-1); BEGIN(INITIAL); }
 <STRING>.   { /* consume */ }
 
@@ -310,67 +390,70 @@ ESC        (\\[abfnrtv\\'"?]|\\x[0-9A-Fa-f]+|\\[0-7]{1,3})
     strncpy(last_ident, yytext, sizeof(last_ident)-1);
     last_ident[sizeof(last_ident)-1]='\0';
     last_was_ident = 1;
-    array_capture_for_ident = 1;
+
+    /* Only allow array-dimension capture during declarations */
+    array_capture_for_ident = in_declaration ? 1 : 0;
+
     if(in_declaration){
         if(!s->type && last_type[0]) sym_set_type(s, last_type);
     }
 }
 
-{HEX}{INTSUFFIX}?   { 
-    print_token("NUMBER", yytext); 
+{HEX}{INTSUFFIX}?   {
+    print_token("NUMBER", yytext);
     const char* var_name = (assignment_context && pending_var[0]) ? pending_var : "-";
-    const_add(var_name, yylineno, yytext, "hex"); 
+    const_add(var_name, yylineno, yytext, "hex");
     if(assignment_context) assignment_context = 0;
-    last_was_ident = 0; 
+    last_was_ident = 0;
 }
-{BIN}{INTSUFFIX}?   { 
-    print_token("NUMBER", yytext); 
+{BIN}{INTSUFFIX}?   {
+    print_token("NUMBER", yytext);
     const char* var_name = (assignment_context && pending_var[0]) ? pending_var : "-";
-    const_add(var_name, yylineno, yytext, "bin"); 
+    const_add(var_name, yylineno, yytext, "bin");
     if(assignment_context) assignment_context = 0;
-    last_was_ident = 0; 
+    last_was_ident = 0;
 }
-{FLOAT1}{FLOATSUF}? { 
-    print_token("NUMBER", yytext); 
+{FLOAT1}{FLOATSUF}? {
+    print_token("NUMBER", yytext);
     const char* var_name = (assignment_context && pending_var[0]) ? pending_var : "-";
-    const_add(var_name, yylineno, yytext, "float"); 
+    const_add(var_name, yylineno, yytext, "float");
     if(assignment_context) assignment_context = 0;
-    last_was_ident = 0; 
+    last_was_ident = 0;
 }
-{FLOAT2}{FLOATSUF}? { 
-    print_token("NUMBER", yytext); 
+{FLOAT2}{FLOATSUF}? {
+    print_token("NUMBER", yytext);
     const char* var_name = (assignment_context && pending_var[0]) ? pending_var : "-";
-    const_add(var_name, yylineno, yytext, "float"); 
+    const_add(var_name, yylineno, yytext, "float");
     if(assignment_context) assignment_context = 0;
-    last_was_ident = 0; 
+    last_was_ident = 0;
 }
-{FLOAT3}{FLOATSUF}? { 
-    print_token("NUMBER", yytext); 
+{FLOAT3}{FLOATSUF}? {
+    print_token("NUMBER", yytext);
     const char* var_name = (assignment_context && pending_var[0]) ? pending_var : "-";
-    const_add(var_name, yylineno, yytext, "float"); 
+    const_add(var_name, yylineno, yytext, "float");
     if(assignment_context) assignment_context = 0;
-    last_was_ident = 0; 
+    last_was_ident = 0;
 }
-{FLOAT4}{FLOATSUF}? { 
-    print_token("NUMBER", yytext); 
+{FLOAT4}{FLOATSUF}? {
+    print_token("NUMBER", yytext);
     const char* var_name = (assignment_context && pending_var[0]) ? pending_var : "-";
-    const_add(var_name, yylineno, yytext, "float"); 
+    const_add(var_name, yylineno, yytext, "float");
     if(assignment_context) assignment_context = 0;
-    last_was_ident = 0; 
+    last_was_ident = 0;
 }
-{OCT}{INTSUFFIX}?   { 
-    print_token("NUMBER", yytext); 
+{OCT}{INTSUFFIX}?   {
+    print_token("NUMBER", yytext);
     const char* var_name = (assignment_context && pending_var[0]) ? pending_var : "-";
-    const_add(var_name, yylineno, yytext, "oct"); 
+    const_add(var_name, yylineno, yytext, "oct");
     if(assignment_context) assignment_context = 0;
-    last_was_ident = 0; 
+    last_was_ident = 0;
 }
-{DIGIT}+{INTSUFFIX}? { 
-    print_token("NUMBER", yytext); 
+{DIGIT}+{INTSUFFIX}? {
+    print_token("NUMBER", yytext);
     const char* var_name = (assignment_context && pending_var[0]) ? pending_var : "-";
-    const_add(var_name, yylineno, yytext, classify_int(yytext)); 
+    const_add(var_name, yylineno, yytext, classify_int(yytext));
     if(assignment_context) assignment_context = 0;
-    last_was_ident = 0; 
+    last_was_ident = 0;
 }
 
 "("       {
@@ -387,14 +470,14 @@ ESC        (\\[abfnrtv\\'"?]|\\x[0-9A-Fa-f]+|\\[0-7]{1,3})
             }
             last_was_ident = 0;
          }
-<FUNCARGS>[^()\n]+   { /* collect raw text inside args */ for(size_t i=0;i<yyleng;i++) args_push_char(yytext[i]); }
+<FUNCARGS>[^()\n]+   { for(size_t i=0;i<(size_t)yyleng;i++) args_push_char(yytext[i]); }
 <FUNCARGS>"("        { args_push_char('('); paren_depth++; }
 <FUNCARGS>")" {
     args_push_char(')');
     paren_depth--;
     if (paren_depth == 0) {
         args_end();
-        print_token("PUNCT", yytext); 
+        print_token("PUNCT", yytext);
         BEGIN(INITIAL);
     }
 }
@@ -404,22 +487,23 @@ ESC        (\\[abfnrtv\\'"?]|\\x[0-9A-Fa-f]+|\\[0-7]{1,3})
 
 "["       { print_token("PUNCT", yytext); last_was_ident = 0; }
 "]"       { print_token("PUNCT", yytext); last_was_ident = 0; }
+
 "["{WS}*{DIGIT}+{WS}*"]"  {
             print_token("PUNCT", yytext);
-            if(array_capture_for_ident){
+            if(in_declaration && array_capture_for_ident){
                 Symbol* s = sym_lookup(last_ident);
                 if(s) sym_append_dims(s, yytext);
             }
             last_was_ident = 0;
          }
 
-";"       { 
-    print_token("PUNCT", yytext); 
-    array_capture_for_ident = 0; 
-    if(in_declaration) end_declaration(); 
-    last_was_ident = 0; 
+";"       {
+    print_token("PUNCT", yytext);
+    array_capture_for_ident = 0;
+    if(in_declaration) end_declaration();
+    last_was_ident = 0;
 }
-","       { print_token("PUNCT", yytext); last_was_ident = 0; }
+","       { print_token("PUNCT", yytext); array_capture_for_ident = 0; last_was_ident = 0; }
 "{"       { print_token("PUNCT", yytext); brace_depth++; if(in_declaration) end_declaration(); last_was_ident = 0; }
 "}"       { print_token("PUNCT", yytext); brace_depth--; last_was_ident = 0; }
 "."|"->"  { print_token("OP", yytext); last_was_ident = 0; }
@@ -436,19 +520,18 @@ ESC        (\\[abfnrtv\\'"?]|\\x[0-9A-Fa-f]+|\\[0-7]{1,3})
 "!"|"~"|"&"|"^"              { print_token("OP", yytext); last_was_ident = 0; }
 "|"                          { print_token("OP", yytext); last_was_ident = 0; }
 "?"|":"                      { print_token("OP", yytext); last_was_ident = 0; }
-"="                          { 
-    print_token("OP", yytext); 
+"="                          {
+    print_token("OP", yytext);
+    array_capture_for_ident = 0; /* definitely not dimensions after '=' */
     if(last_was_ident) {
         assignment_context = 1;
         strncpy(pending_var, last_ident, sizeof(pending_var)-1);
         pending_var[sizeof(pending_var)-1] = '\0';
     }
-    last_was_ident = 0; 
+    last_was_ident = 0;
 }
 
-.         {
-            fprintf(stderr, "[line %d] ERROR: Invalid token '%s'\n", yylineno, yytext);
-          }
+.         { fprintf(stderr, "[line %d] ERROR: Invalid token '%s'\n", yylineno, yytext); }
 
 <<EOF>>   {
             printf("\n************************************* SYMBOL TABLE *************************************\n");
